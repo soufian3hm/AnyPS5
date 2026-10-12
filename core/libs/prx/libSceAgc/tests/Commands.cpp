@@ -38,6 +38,7 @@ extern "C" std::uint32_t* APS5_VABI sceAgcDcbSetBaseIndirectArgs(CommandBuffer* 
 extern "C" std::uint32_t* APS5_VABI sceAgcSetNop(CommandBuffer* buf, std::uint32_t sizeDw);
 extern "C" int APS5_VABI sceAgcDebugRaiseException(std::uint32_t exceptionId);
 extern "C" std::uint32_t* APS5_VABI sceAgcAcbAtomicGds_0900(CommandBuffer* buf, std::uint32_t control, std::uint32_t mode, std::uint32_t gdsOp, std::uint32_t src, std::uint16_t offset, std::uint16_t index, std::uint32_t mask, std::uint32_t data, std::uint64_t compareData, std::uint64_t extraData);
+extern "C" std::uint32_t* APS5_VABI sceAgcDcbAtomicGds_0900(CommandBuffer* buf, std::uint32_t engine, std::uint32_t control, std::uint32_t mode, std::uint32_t gdsOp, std::uint32_t src, std::uint16_t offset, std::uint16_t index, std::uint32_t mask, std::uint32_t data, std::uint64_t compareData, std::uint64_t extraData);
 
 namespace {
 
@@ -500,6 +501,60 @@ void testAtomicGds() {
     }
 }
 
+void testDcbAtomicGds() {
+    Storage storage;
+    storage.words.fill(0xdeadbeefu);
+    storage.buffer.cursor_up += 2;
+    auto* packet = sceAgcDcbAtomicGds_0900(&storage.buffer, 0xffffffffu, 0xffffffffu, 1, 0xffffffffu, 0xffffffffu,
+        0xabcd, 0xfedc, 0x12345678u, 0x87654321u, 0xfedcba9876543210ull, 0x0123456789abcdefull);
+    const std::array<std::uint32_t, 11> expected{
+        0xc0091d00u, 0xc01500ffu, 0x13fu, 0xabcdu, 0xfedcu, 0x00340078u,
+        0x87654321u, 0x76543210u, 0xfedcba98u, 0x89abcdefu, 0x01234567u};
+    check(packet == storage.words.data() + 2, "DCB atomic GDS returned the wrong packet address");
+    check(std::equal(expected.begin(), expected.end(), packet), "DCB atomic GDS packet or guest ABI mismatch");
+    check(storage.buffer.cursor_up == packet + expected.size(), "DCB atomic GDS did not advance by eleven words");
+    check(storage.words[0] == 0xdeadbeefu && storage.words[1] == 0xdeadbeefu &&
+        std::all_of(storage.words.begin() + 13, storage.words.end(), [](auto word) { return word == 0xdeadbeefu; }),
+        "DCB atomic GDS wrote outside its packet");
+
+    for (const std::uint32_t engine : {0u, 1u, 2u, 3u, 0xfffffffcu, 0xffffffffu}) {
+        Storage engineStorage;
+        auto* enginePacket = sceAgcDcbAtomicGds_0900(&engineStorage.buffer, engine, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+        std::array<std::uint32_t, 11> engineExpected{};
+        engineExpected[0] = 0xc0091d00u;
+        engineExpected[1] = (engine & 3u) << 30u;
+        check(std::equal(engineExpected.begin(), engineExpected.end(), enginePacket), "DCB atomic GDS engine field mismatch");
+    }
+
+    const std::array<std::array<std::uint32_t, 7>, 3> console{{
+        {0x11111111u, 0x22222222u, 0x33333333u, 0x44444444u, 0x55555555u, 0x40050022u, 0x15u},
+        {1, 2, 3, 4, 5, 0x40000002u, 0x5u},
+        {0x22222222u, 0x44444444u, 0, 0, 0, 0x80100044u, 0}}};
+    for (const auto& entry : console) {
+        Storage consoleStorage;
+        auto* consolePacket = sceAgcDcbAtomicGds_0900(&consoleStorage.buffer, entry[0], entry[1], entry[2], entry[3], entry[4],
+            0, 0, 0, 0, 0, 0);
+        check(consolePacket[0] == 0xc0091d00u && consolePacket[1] == entry[5] && consolePacket[2] == entry[6],
+            "DCB atomic GDS register arguments differ from the console vectors");
+    }
+
+    auto emit = [](CommandBuffer* buffer) {
+        return sceAgcDcbAtomicGds_0900(buffer, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+    };
+    Storage exhausted;
+    exhausted.buffer.cursor_down = exhausted.words.data() + 10;
+    const auto before = exhausted.words;
+    expectFailure([&] { emit(&exhausted.buffer); });
+    check(exhausted.words == before && exhausted.buffer.cursor_up == exhausted.words.data(),
+        "failed DCB atomic GDS allocation modified the buffer");
+    expectFailure([&] { emit(nullptr); });
+
+    AtomicGdsAllocation allocation;
+    CommandBuffer growing{nullptr, nullptr, nullptr, nullptr, growAtomicGds, &allocation, 4};
+    check(emit(&growing) == allocation.storage.words.data() && allocation.calls == 1 &&
+        growing.cursor_up == allocation.storage.words.data() + 11, "DCB atomic GDS did not use the guest allocation callback");
+}
+
 void testDebugRaiseException() {
     int result = -1;
     try {
@@ -556,6 +611,7 @@ int main(int argc, char** argv) {
         testPacketPayloadAddress();
         testMemory();
         testAtomicGds();
+        testDcbAtomicGds();
         testDebugRaiseException();
         testDefaults();
         LibcRunShutdown_nid_postfix();
